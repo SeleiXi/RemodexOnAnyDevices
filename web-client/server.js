@@ -48,6 +48,30 @@ const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const CODEX_GLOBAL_STATE_FILE = path.join(CODEX_HOME, ".codex-global-state.json");
 const PROJECT_SUGGESTION_LIMIT = Number.parseInt(process.env.REMODEX_WEB_PROJECT_SUGGESTION_LIMIT || "12", 10);
 const PROJECT_HINT_ROOT_NAMES = ["coding", "projects", "work", "workspace", "src"];
+const MENTION_SUGGESTION_LIMIT = Number.parseInt(process.env.REMODEX_WEB_MENTION_SUGGESTION_LIMIT || "12", 10);
+// Skill roots searched when the user types "@" in the composer. Project-local roots
+// (resolved against the active cwd) are added on top of these global roots at request time.
+const SKILL_GLOBAL_ROOTS = [
+  path.join(CODEX_HOME, "skills"),
+  path.join(os.homedir(), ".claude", "skills"),
+  path.join(os.homedir(), ".cursor", "skills-cursor"),
+];
+const SKILL_PROJECT_ROOT_NAMES = [
+  path.join(".codex", "skills"),
+  path.join(".claude", "skills"),
+  path.join(".cursor", "skills-cursor"),
+  "skills",
+];
+const MENTION_IGNORED_DIR_NAMES = new Set([
+  ".git",
+  "node_modules",
+  ".next",
+  ".cache",
+  "dist",
+  "build",
+  ".venv",
+  "__pycache__",
+]);
 
 class RemodexWebClient {
   constructor() {
@@ -1384,6 +1408,32 @@ async function handleApiRequest(req, res, url) {
     return;
   }
 
+  if (req.method === "GET" && url.pathname === "/api/skill-suggestions") {
+    const suggestions = listSkillSuggestions(
+      url.searchParams.get("q") || "",
+      url.searchParams.get("cwd") || "",
+      MENTION_SUGGESTION_LIMIT
+    );
+    writeJson(res, 200, {
+      ok: true,
+      suggestions,
+    });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/file-suggestions") {
+    const suggestions = listFileSuggestions(
+      url.searchParams.get("q") || "",
+      url.searchParams.get("cwd") || "",
+      MENTION_SUGGESTION_LIMIT
+    );
+    writeJson(res, 200, {
+      ok: true,
+      suggestions,
+    });
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/threads") {
     const body = await readJsonBody(req);
     const thread = await client.createThread({
@@ -1412,9 +1462,11 @@ async function handleApiRequest(req, res, url) {
   if (req.method === "POST" && turnMatch) {
     const threadId = decodeURIComponent(turnMatch[1]);
     const body = await readJsonBody(req);
-    const result = await client.startTurn(threadId, body.text || "", {
+    const resolvedCwd = resolveRequestedProjectPath(body?.cwd || "");
+    const expandedText = expandSkillMentions(body.text || "", resolvedCwd);
+    const result = await client.startTurn(threadId, expandedText, {
       ...(body || {}),
-      cwd: resolveRequestedProjectPath(body?.cwd || ""),
+      cwd: resolvedCwd,
     });
     writeJson(res, 200, {
       ok: true,
@@ -1728,6 +1780,327 @@ function dedupeProjectSuggestions(suggestions, limit) {
   }
 
   return deduped;
+}
+
+// ─── Skill + file "@" mention suggestions ───────────────────────────
+
+// Lists Codex/Claude/Cursor skills (global + project-local) for the composer "@" menu.
+function listSkillSuggestions(rawQuery, rawCwd, limit = MENTION_SUGGESTION_LIMIT) {
+  const normalizedLimit = Number.isFinite(Number(limit)) ? Math.max(1, Number(limit)) : MENTION_SUGGESTION_LIMIT;
+  const query = String(rawQuery || "").trim().toLowerCase();
+  const roots = collectSkillRoots(rawCwd);
+  const seenNames = new Set();
+  const matches = [];
+
+  for (const { root, scope } of roots) {
+    if (!directoryExists(root)) {
+      continue;
+    }
+
+    let entries;
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+
+      const skillFile = path.join(root, entry.name, "SKILL.md");
+      if (!safeStat(skillFile)?.isFile()) {
+        continue;
+      }
+
+      const meta = parseSkillMetadata(skillFile);
+      const name = meta.name || entry.name;
+      const dedupeKey = name.toLowerCase();
+      if (seenNames.has(dedupeKey)) {
+        continue;
+      }
+      if (query && !name.toLowerCase().includes(query) && !meta.description.toLowerCase().includes(query)) {
+        continue;
+      }
+
+      seenNames.add(dedupeKey);
+      matches.push({
+        kind: "skill",
+        scope,
+        name,
+        label: name,
+        description: meta.description,
+        detail: meta.description || skillFile,
+        path: skillFile,
+      });
+    }
+  }
+
+  // Project-local skills win ties so they are never crowded out by the many global skills.
+  matches.sort(
+    (left, right) =>
+      skillMatchRank(left, query) - skillMatchRank(right, query)
+      || scopeRank(left.scope) - scopeRank(right.scope)
+      || left.name.localeCompare(right.name)
+  );
+  return matches.slice(0, normalizedLimit).map(({ scope, ...rest }) => rest);
+}
+
+function scopeRank(scope) {
+  return scope === "project" ? 0 : 1;
+}
+
+function skillMatchRank(suggestion, query) {
+  if (!query) {
+    return 1;
+  }
+
+  const name = String(suggestion.name || "").toLowerCase();
+  if (name === query) {
+    return 0;
+  }
+  if (name.startsWith(query)) {
+    return 1;
+  }
+  if (name.includes(query)) {
+    return 2;
+  }
+  return 3;
+}
+
+function collectSkillRoots(rawCwd) {
+  const roots = [];
+  const seen = new Set();
+  const pushRoot = (root, scope) => {
+    const normalized = path.normalize(root);
+    if (seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    roots.push({ root: normalized, scope });
+  };
+
+  const baseDir = normalizeProjectPath(rawCwd);
+  if (baseDir && directoryExists(baseDir)) {
+    for (const relRoot of SKILL_PROJECT_ROOT_NAMES) {
+      pushRoot(path.join(baseDir, relRoot), "project");
+    }
+  }
+  for (const root of SKILL_GLOBAL_ROOTS) {
+    pushRoot(root, "global");
+  }
+  return roots;
+}
+
+function parseSkillMetadata(skillFilePath) {
+  const result = { name: "", description: "" };
+  let raw = "";
+  try {
+    raw = fs.readFileSync(skillFilePath, "utf8");
+  } catch {
+    return result;
+  }
+
+  const frontmatter = extractFrontmatterBlock(raw);
+  if (!frontmatter) {
+    return result;
+  }
+
+  result.name = readFrontmatterValue(frontmatter, "name");
+  result.description = readFrontmatterValue(frontmatter, "description");
+  return result;
+}
+
+function extractFrontmatterBlock(raw) {
+  const text = String(raw || "").replace(/^\uFEFF/, "");
+  const match = text.match(/^---\s*\r?\n([\s\S]*?)\r?\n---/);
+  return match ? match[1] : "";
+}
+
+function readFrontmatterValue(frontmatter, key) {
+  const lines = String(frontmatter || "").split(/\r?\n/);
+  const prefix = `${key}:`;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.toLowerCase().startsWith(prefix)) {
+      continue;
+    }
+
+    let value = trimmed.slice(prefix.length).trim();
+    if (
+      (value.startsWith("\"") && value.endsWith("\""))
+      || (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    return value.replace(/\\"/g, "\"").trim();
+  }
+  return "";
+}
+
+// Lists files/directories inside the active working directory for the composer "@" menu.
+function listFileSuggestions(rawQuery, rawCwd, limit = MENTION_SUGGESTION_LIMIT) {
+  const normalizedLimit = Number.isFinite(Number(limit)) ? Math.max(1, Number(limit)) : MENTION_SUGGESTION_LIMIT;
+  const baseDir = resolveMentionBaseDir(rawCwd);
+  const query = String(rawQuery || "").replace(/\\/g, "/").replace(/^\/+/, "");
+  const segments = query.split("/");
+  const prefix = segments.pop() || "";
+  const relDir = segments.join("/");
+  const searchDir = relDir ? path.resolve(baseDir, relDir) : baseDir;
+
+  // Never escape the bound working directory.
+  const containment = path.relative(baseDir, searchDir);
+  if (containment.startsWith("..") || path.isAbsolute(containment)) {
+    return [];
+  }
+  if (!directoryExists(searchDir)) {
+    return [];
+  }
+
+  let entries;
+  try {
+    entries = fs.readdirSync(searchDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const lowerPrefix = prefix.toLowerCase();
+  return entries
+    .filter((entry) => !(entry.isDirectory() && MENTION_IGNORED_DIR_NAMES.has(entry.name)))
+    .filter((entry) => mentionEntryMatches(entry.name, lowerPrefix))
+    .sort((left, right) => {
+      const dirDelta = Number(right.isDirectory()) - Number(left.isDirectory());
+      if (dirDelta !== 0) {
+        return dirDelta;
+      }
+      return left.name.localeCompare(right.name);
+    })
+    .slice(0, normalizedLimit)
+    .map((entry) => {
+      const absPath = path.join(searchDir, entry.name);
+      const relPath = toPosixRelative(baseDir, absPath);
+      const isDir = entry.isDirectory();
+      return {
+        kind: isDir ? "directory" : "file",
+        name: entry.name,
+        label: entry.name,
+        detail: isDir ? `${relPath}/` : relPath,
+        path: isDir ? `${relPath}/` : relPath,
+        absPath,
+      };
+    });
+}
+
+function mentionEntryMatches(name, lowerPrefix) {
+  if (!name) {
+    return false;
+  }
+
+  const isHidden = name.startsWith(".");
+  if (isHidden && !lowerPrefix.startsWith(".")) {
+    return false;
+  }
+  if (!lowerPrefix) {
+    return true;
+  }
+  return name.toLowerCase().includes(lowerPrefix);
+}
+
+function toPosixRelative(baseDir, absPath) {
+  return path.relative(baseDir, absPath).split(path.sep).join("/");
+}
+
+function resolveMentionBaseDir(rawCwd) {
+  const normalized = normalizeProjectPath(rawCwd);
+  if (normalized && directoryExists(normalized)) {
+    return normalized;
+  }
+  return REPO_DIR;
+}
+
+// Rewrites "@skill:<name>" composer tokens into an instruction block that points
+// Codex at the resolved SKILL.md so the referenced skill is actually loaded.
+function expandSkillMentions(rawText, rawCwd) {
+  const text = String(rawText || "");
+  if (!text.includes("@skill:")) {
+    return text;
+  }
+
+  const requested = new Map();
+  const mentionPattern = /@skill:([A-Za-z0-9._\-/]+)/g;
+  const inlined = text.replace(mentionPattern, (match, rawName) => {
+    const name = String(rawName || "").replace(/[.,;:)\]]+$/, "");
+    if (!name) {
+      return match;
+    }
+    if (!requested.has(name)) {
+      requested.set(name, resolveSkillByName(name, rawCwd));
+    }
+    return `\`${name}\``;
+  });
+
+  if (requested.size === 0) {
+    return text;
+  }
+
+  const lines = [
+    "",
+    "",
+    "[Skills referenced via @ — read each SKILL.md in full and follow its instructions:]",
+  ];
+  for (const [name, resolved] of requested) {
+    if (resolved?.path) {
+      lines.push(`- \`${name}\`: ${resolved.path}`);
+    } else {
+      lines.push(`- \`${name}\`: (skill not found on this machine)`);
+    }
+  }
+
+  return `${inlined}${lines.join("\n")}`;
+}
+
+function resolveSkillByName(name, rawCwd) {
+  const target = String(name || "").trim().toLowerCase();
+  if (!target) {
+    return null;
+  }
+
+  for (const { root } of collectSkillRoots(rawCwd)) {
+    if (!directoryExists(root)) {
+      continue;
+    }
+
+    const directGuess = path.join(root, name, "SKILL.md");
+    if (safeStat(directGuess)?.isFile()) {
+      const meta = parseSkillMetadata(directGuess);
+      return { name: meta.name || name, description: meta.description, path: directGuess };
+    }
+
+    let entries;
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const skillFile = path.join(root, entry.name, "SKILL.md");
+      if (!safeStat(skillFile)?.isFile()) {
+        continue;
+      }
+      const meta = parseSkillMetadata(skillFile);
+      const skillName = (meta.name || entry.name).toLowerCase();
+      if (skillName === target || entry.name.toLowerCase() === target) {
+        return { name: meta.name || entry.name, description: meta.description, path: skillFile };
+      }
+    }
+  }
+
+  return null;
 }
 
 function shouldIncludeSuggestionEntry(name, prefix) {
@@ -2983,5 +3356,10 @@ module.exports = {
   decodeThreadMessages,
   mergeTransientThreadMessages,
   shouldRetryTurnStartWithoutCollaborationMode,
+  listSkillSuggestions,
+  listFileSuggestions,
+  parseSkillMetadata,
+  expandSkillMentions,
+  resolveSkillByName,
   server,
 };

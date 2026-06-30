@@ -139,6 +139,16 @@ The web client is intended for local administration and chat access against your
 - it keeps auth/security state under `web-client/state/`
 - it does not assume any hosted backend
 - it now includes a mobile-oriented chat layout instead of a desktop-only squeeze-down
+- type `@` in the composer to mention an installed skill or a file/folder from the active working directory
+
+### `@` mentions (skills and files)
+
+Inside the chat composer, typing `@` opens an inline picker with two groups:
+
+- **Skills**: any skill found in `~/.codex/skills`, `~/.claude/skills`, `~/.cursor/skills-cursor`, or a project-local `.codex/skills` (etc.) under the thread's working directory. Selecting one inserts an `@skill:<name>` token. On send, the web client expands that token into an instruction that points Codex at the resolved `SKILL.md`, so the skill is actually loaded and followed.
+- **Files in working directory**: files and folders under the active `cwd`. Selecting a folder lets you keep drilling into the path; selecting a file inserts an `@<relative/path>` reference that Codex resolves natively.
+
+Use arrow keys to move, `Enter`/`Tab` to insert, and `Esc` to dismiss the picker.
 
 See [web-client/README.md](web-client/README.md) for details.
 
