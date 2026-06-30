@@ -29,6 +29,16 @@ const state = {
   isLoadingProjectSuggestions: false,
   projectSuggestions: [],
   projectSuggestionRequestId: 0,
+  mention: {
+    open: false,
+    query: "",
+    start: -1,
+    end: -1,
+    items: [],
+    activeIndex: 0,
+    requestId: 0,
+    loading: false,
+  },
   statusPoller: null,
   threadPoller: null,
   messagePoller: null,
@@ -90,6 +100,7 @@ const elements = {
   messageList: document.querySelector("#message-list"),
   composerForm: document.querySelector("#composer-form"),
   composerInput: document.querySelector("#composer-input"),
+  composerMentionPopup: document.querySelector("#composer-mention-popup"),
   steeringInput: document.querySelector("#steering-input"),
   modelButton: document.querySelector("#model-button"),
   modelMenu: document.querySelector("#model-menu"),
@@ -165,6 +176,13 @@ function bindEvents() {
   elements.homeSecondaryButton.addEventListener("click", handleHomeSecondaryAction);
   elements.statusBannerAction.addEventListener("click", handleBannerAction);
   elements.composerForm.addEventListener("submit", sendMessage);
+  elements.composerInput.addEventListener("input", handleComposerInput);
+  elements.composerInput.addEventListener("keydown", handleComposerKeydown);
+  elements.composerInput.addEventListener("click", () => updateMentionContext());
+  elements.composerInput.addEventListener("blur", () => {
+    // Allow click selection on the popup to land before closing.
+    window.setTimeout(() => closeMentionPopup(), 150);
+  });
   elements.steeringInput?.addEventListener("input", renderComposerMeta);
   elements.modelButton.addEventListener("click", toggleModelMenu);
   elements.reasoningButton.addEventListener("click", toggleReasoningMenu);
@@ -731,6 +749,7 @@ async function sendMessage(event) {
       },
     });
     elements.composerInput.value = "";
+    closeMentionPopup();
     if (shouldUsePlanMode) {
       if (elements.steeringInput) {
         elements.steeringInput.value = "";
@@ -747,6 +766,245 @@ async function sendMessage(event) {
     elements.composerInput.disabled = false;
     elements.composerInput.focus();
   }
+}
+
+// ─── Composer "@" mentions (skills + working-directory files) ────────
+
+const MENTION_GROUP_LIMIT = 8;
+
+function handleComposerInput() {
+  updateMentionContext();
+}
+
+function updateMentionContext() {
+  const input = elements.composerInput;
+  if (!input) {
+    return;
+  }
+
+  const caret = input.selectionStart ?? input.value.length;
+  const token = detectMentionToken(input.value, caret);
+  if (!token) {
+    closeMentionPopup();
+    return;
+  }
+
+  const mention = state.mention;
+  mention.open = true;
+  mention.start = token.start;
+  mention.end = caret;
+  mention.query = token.query;
+  void refreshMentionSuggestions(token.query);
+}
+
+// Returns the active "@" token under the caret, or null when not inside one.
+function detectMentionToken(text, caret) {
+  let index = caret - 1;
+  while (index >= 0) {
+    const char = text[index];
+    if (char === "@") {
+      const prev = index > 0 ? text[index - 1] : "";
+      if (prev === "" || /\s/.test(prev) || "([{".includes(prev)) {
+        return { start: index, query: text.slice(index + 1, caret) };
+      }
+      return null;
+    }
+    if (/\s/.test(char)) {
+      return null;
+    }
+    index -= 1;
+  }
+  return null;
+}
+
+async function refreshMentionSuggestions(rawQuery) {
+  const mention = state.mention;
+  const requestId = mention.requestId + 1;
+  mention.requestId = requestId;
+  mention.loading = true;
+
+  const cwd = elements.projectPath ? elements.projectPath.value : "";
+  const skillQuery = rawQuery.startsWith("skill:") ? rawQuery.slice("skill:".length) : rawQuery;
+  const isSkillScoped = rawQuery.startsWith("skill:");
+
+  try {
+    const [skillResult, fileResult] = await Promise.all([
+      fetchJson(`/api/skill-suggestions?q=${encodeURIComponent(skillQuery)}&cwd=${encodeURIComponent(cwd)}`)
+        .catch(() => ({ suggestions: [] })),
+      isSkillScoped
+        ? Promise.resolve({ suggestions: [] })
+        : fetchJson(`/api/file-suggestions?q=${encodeURIComponent(rawQuery)}&cwd=${encodeURIComponent(cwd)}`)
+          .catch(() => ({ suggestions: [] })),
+    ]);
+
+    if (requestId !== mention.requestId) {
+      return;
+    }
+
+    const skills = (skillResult.suggestions || []).slice(0, MENTION_GROUP_LIMIT);
+    const files = (fileResult.suggestions || []).slice(0, MENTION_GROUP_LIMIT);
+    mention.items = [...skills, ...files];
+    mention.activeIndex = 0;
+    mention.loading = false;
+    renderMentionPopup();
+  } catch {
+    if (requestId === mention.requestId) {
+      mention.items = [];
+      mention.loading = false;
+      renderMentionPopup();
+    }
+  }
+}
+
+function handleComposerKeydown(event) {
+  const mention = state.mention;
+  if (!mention.open) {
+    return;
+  }
+
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeMentionPopup();
+    return;
+  }
+
+  if (!mention.items.length) {
+    return;
+  }
+
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    setMentionActiveIndex(mention.activeIndex + 1);
+    return;
+  }
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    setMentionActiveIndex(mention.activeIndex - 1);
+    return;
+  }
+  if (event.key === "Enter" || event.key === "Tab") {
+    event.preventDefault();
+    applyMentionSelection(mention.items[mention.activeIndex]);
+  }
+}
+
+function setMentionActiveIndex(nextIndex) {
+  const mention = state.mention;
+  const count = mention.items.length;
+  if (!count) {
+    return;
+  }
+  mention.activeIndex = ((nextIndex % count) + count) % count;
+  renderMentionPopup();
+}
+
+function applyMentionSelection(item) {
+  if (!item) {
+    return;
+  }
+
+  const input = elements.composerInput;
+  const mention = state.mention;
+  const insertion = item.kind === "skill"
+    ? `@skill:${item.name} `
+    : `@${item.path} `;
+
+  const before = input.value.slice(0, mention.start);
+  const after = input.value.slice(mention.end);
+  input.value = `${before}${insertion}${after}`;
+
+  const caret = before.length + insertion.length;
+  input.setSelectionRange(caret, caret);
+  closeMentionPopup();
+  input.focus();
+
+  // A directory selection lets the user keep drilling into the path.
+  if (item.kind === "directory") {
+    updateMentionContext();
+  }
+}
+
+function closeMentionPopup() {
+  const mention = state.mention;
+  if (!mention.open && mention.items.length === 0) {
+    if (elements.composerMentionPopup) {
+      elements.composerMentionPopup.hidden = true;
+    }
+    return;
+  }
+  mention.open = false;
+  mention.items = [];
+  mention.query = "";
+  mention.start = -1;
+  mention.end = -1;
+  mention.activeIndex = 0;
+  if (elements.composerMentionPopup) {
+    elements.composerMentionPopup.hidden = true;
+    elements.composerMentionPopup.innerHTML = "";
+  }
+}
+
+function renderMentionPopup() {
+  const popup = elements.composerMentionPopup;
+  const mention = state.mention;
+  if (!popup) {
+    return;
+  }
+
+  if (!mention.open) {
+    popup.hidden = true;
+    return;
+  }
+
+  popup.hidden = false;
+  popup.innerHTML = "";
+
+  if (mention.loading && mention.items.length === 0) {
+    popup.innerHTML = "<p class=\"mention-empty\">Searching skills and files...</p>";
+    return;
+  }
+
+  if (mention.items.length === 0) {
+    popup.innerHTML = "<p class=\"mention-empty\">No matching skills or files.</p>";
+    return;
+  }
+
+  let renderedKind = "";
+  mention.items.forEach((item, index) => {
+    const groupKind = item.kind === "skill" ? "skill" : "file";
+    if (groupKind !== renderedKind) {
+      renderedKind = groupKind;
+      const heading = document.createElement("div");
+      heading.className = "mention-group-label";
+      heading.textContent = groupKind === "skill" ? "Skills" : "Files in working directory";
+      popup.appendChild(heading);
+    }
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "mention-item";
+    button.setAttribute("role", "option");
+    if (index === mention.activeIndex) {
+      button.classList.add("is-active");
+      button.setAttribute("aria-selected", "true");
+    }
+
+    const icon = item.kind === "skill" ? "✦" : item.kind === "directory" ? "▸" : "·";
+    button.innerHTML = `
+      <span class="mention-item-icon">${icon}</span>
+      <span class="mention-item-body">
+        <span class="mention-item-name">${escapeHTML(item.label || item.name)}</span>
+        <span class="mention-item-detail">${escapeHTML(item.detail || item.path || "")}</span>
+      </span>
+      <span class="mention-item-kind">${escapeHTML(item.kind)}</span>
+    `;
+    button.addEventListener("mousedown", (event) => {
+      // Prevent the textarea blur from closing the popup before selection.
+      event.preventDefault();
+    });
+    button.addEventListener("click", () => applyMentionSelection(item));
+    popup.appendChild(button);
+  });
 }
 
 async function respondToApproval(decision) {

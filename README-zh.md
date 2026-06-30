@@ -139,5 +139,15 @@ Web Client 用于在你自己的 bridge 运行时进行本地管理和聊天访�
 - 它会将认证 / 安全状态保存在 `web-client/state/` 下
 - 它不依赖任何托管后端
 - 它现在包含一个面向移动端的聊天布局，而不是仅仅把桌面布局硬压缩到小屏幕上
+- 在输入框中输入 `@` 即可引用已安装的 skill，或当前工作目录下的文件/文件夹
+
+### `@` 引用（skill 与文件）
+
+在聊天输入框中输入 `@` 会弹出一个内联选择器，包含两组：
+
+- **Skills**：来自 `~/.codex/skills`、`~/.claude/skills`、`~/.cursor/skills-cursor`，以及当前线程工作目录下的项目级 `.codex/skills` 等目录中的 skill。选中后会插入 `@skill:<name>` 标记；发送时，Web Client 会把该标记展开为一段指令，指向解析出的 `SKILL.md` 绝对路径，从而让 Codex 真正加载并遵循该 skill。
+- **当前目录文件**：当前 `cwd` 下的文件与文件夹。选中文件夹可继续深入路径；选中文件会插入 `@<相对路径>` 引用，由 Codex 原生解析。
+
+使用方向键移动，`Enter`/`Tab` 插入，`Esc` 关闭选择器。
 
 详情见 [web-client/README.md](web-client/README.md)。
